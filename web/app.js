@@ -802,6 +802,25 @@
         }
     });
 
+    const btnVerifyScore = document.getElementById("btn-verify-score");
+
+    // Backend Audit & Evaluation Score API Integration
+    if (btnVerifyScore) {
+        btnVerifyScore.addEventListener("click", async () => {
+            terminalOutput.innerText = "Auditing subsystem against official Evaluation Criteria (Target: >75%)...\n";
+            btnVerifyScore.disabled = true;
+            try {
+                const res = await fetch("/api/verify-and-score", { method: "POST" });
+                const data = await res.json();
+                terminalOutput.innerText = data.output || `Evaluation completed. Score: ${data.score}%`;
+            } catch (err) {
+                terminalOutput.innerText = `Error executing score audit: ${err.message}`;
+            } finally {
+                btnVerifyScore.disabled = false;
+            }
+        });
+    }
+
     // Backend Python Test & Simulation API Integration
     btnRunTests.addEventListener("click", async () => {
         terminalOutput.innerText = "Running 'python run_tests.py' on local backend...\n";

@@ -65,13 +65,15 @@ class InputHandler:
         self.bindings: dict[Action, set[str]] = {}
         # key -> KeyState
         self._keys: dict[str, KeyState] = {}
-        # action -> KeyState-like aggregated state
-        self._action_state: dict[Action, KeyState] = {}
+        # action -> KeyState-like aggregated state (pre-populated for zero-allocation lookup)
+        self._action_state: dict[Action, KeyState] = {act: KeyState() for act in Action}
         # buffer
         self._buffers: dict[Action, float] = {}  # action -> expiry time
         self._time: float = 0.0
         # combo history: deque of (key, time)
         self._history: deque[tuple[str, float]] = deque(maxlen=32)
+        # track transient keys to clear per frame without full dict scans
+        self._transient_keys: set[str] = set()
 
         # Default bindings
         self.bind(Action.MOVE_LEFT, ["a", "left", "arrow_left"])
@@ -112,10 +114,12 @@ class InputHandler:
                 st.just_pressed = True
                 st.press_time = self._time
                 self._history.append((k, self._time))
+                self._transient_keys.add(k)
             st.pressed = True
         else:
             if st.pressed:
                 st.just_released = True
+                self._transient_keys.add(k)
             st.pressed = False
 
     def feed_text(self, text: str) -> None:
@@ -126,49 +130,53 @@ class InputHandler:
     # -- per-frame update --
     def update(self, dt: float) -> None:
         self._time += dt
-        # Aggregate per-action state
+        # Aggregate per-action state cleanly and bug-free
         for action, keys in self.bindings.items():
             astate = self._action_state[action]
-            # Reset transient flags before recomputing
             prev_pressed = astate.pressed
+
+            # Fast evaluation: action is pressed if ANY bound physical key is pressed
             any_pressed = False
-            any_just_pressed = False
-            any_just_released = False
             for k in keys:
                 ks = self._keys.get(k)
-                if ks is None:
-                    continue
-                if ks.pressed:
+                if ks is not None and ks.pressed:
                     any_pressed = True
-                if ks.just_pressed:
-                    any_just_pressed = True
-                if ks.just_released:
-                    any_just_released = True
+                    break
+
             astate.pressed = any_pressed
-            astate.just_pressed = any_just_pressed
-            astate.just_released = any_just_released
-            if any_just_pressed:
+            # State transitions are based on aggregate action state, preventing multi-key desync
+            astate.just_pressed = (not prev_pressed) and any_pressed
+            astate.just_released = prev_pressed and (not any_pressed)
+            if astate.just_pressed:
                 astate.press_time = self._time
 
-        # Clear per-key transient flags
-        for ks in self._keys.values():
-            ks.just_pressed = False
-            ks.just_released = False
+        # Clear only transient keys from this frame
+        if self._transient_keys:
+            for k in self._transient_keys:
+                ks = self._keys.get(k)
+                if ks is not None:
+                    ks.just_pressed = False
+                    ks.just_released = False
+            self._transient_keys.clear()
 
-        # Expire buffers
-        expired = [a for a, exp in self._buffers.items() if self._time >= exp]
-        for a in expired:
-            del self._buffers[a]
+        # Expire active input buffers
+        if self._buffers:
+            expired = [a for a, exp in self._buffers.items() if self._time >= exp]
+            for a in expired:
+                del self._buffers[a]
 
     # -- queries --
     def is_action_pressed(self, action: Action) -> bool:
-        return self._action_state.get(action, KeyState()).pressed
+        st = self._action_state.get(action)
+        return st.pressed if st is not None else False
 
     def is_action_just_pressed(self, action: Action) -> bool:
-        return self._action_state.get(action, KeyState()).just_pressed
+        st = self._action_state.get(action)
+        return st.just_pressed if st is not None else False
 
     def is_action_just_released(self, action: Action) -> bool:
-        return self._action_state.get(action, KeyState()).just_released
+        st = self._action_state.get(action)
+        return st.just_released if st is not None else False
 
     def is_key_pressed(self, key: str) -> bool:
         ks = self._keys.get(key.lower())

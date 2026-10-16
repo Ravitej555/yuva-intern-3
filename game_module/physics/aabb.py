@@ -1,17 +1,38 @@
 """
 AABB - Axis-Aligned Bounding Box for collision detection.
+
+Optimized with __slots__, zero-allocation point queries, direct axis accessors,
+and fused overlap/MTV calculation.
 """
 from __future__ import annotations
-from dataclasses import dataclass
 from game_module.physics.vector2 import Vector2
 
 
-@dataclass
 class AABB:
-    """AABB defined by center and half-extents."""
+    """AABB defined by center and half-extents with zero-allocation query methods."""
 
-    center: Vector2
-    half_size: Vector2  # half-width, half-height
+    __slots__ = ("center", "half_size")
+
+    def __init__(self, center: Vector2, half_size: Vector2) -> None:
+        self.center = center
+        self.half_size = half_size
+
+    # Direct scalar bounds (zero heap allocations)
+    @property
+    def min_x(self) -> float:
+        return self.center.x - self.half_size.x
+
+    @property
+    def max_x(self) -> float:
+        return self.center.x + self.half_size.x
+
+    @property
+    def min_y(self) -> float:
+        return self.center.y - self.half_size.y
+
+    @property
+    def max_y(self) -> float:
+        return self.center.y + self.half_size.y
 
     @property
     def min(self) -> Vector2:
@@ -25,11 +46,11 @@ class AABB:
 
     @property
     def width(self) -> float:
-        return self.half_size.x * 2
+        return self.half_size.x * 2.0
 
     @property
     def height(self) -> float:
-        return self.half_size.y * 2
+        return self.half_size.y * 2.0
 
     @classmethod
     def from_min_max(cls, min_pt: Vector2, max_pt: Vector2) -> AABB:
@@ -40,30 +61,43 @@ class AABB:
         return cls(center, half)
 
     def contains_point(self, pt: Vector2) -> bool:
-        mi, ma = self.min, self.max
-        return mi.x <= pt.x <= ma.x and mi.y <= pt.y <= ma.y
+        """Zero-allocation point-in-box containment test."""
+        cx, cy = self.center.x, self.center.y
+        hx, hy = self.half_size.x, self.half_size.y
+        return (cx - hx <= pt.x <= cx + hx) and (cy - hy <= pt.y <= cy + hy)
 
     def intersects(self, other: AABB) -> bool:
         """AABB-AABB overlap test."""
-        return abs(self.center.x - other.center.x) <= (self.half_size.x + other.half_size.x) and \
-               abs(self.center.y - other.center.y) <= (self.half_size.y + other.half_size.y)
+        return (abs(self.center.x - other.center.x) <= (self.half_size.x + other.half_size.x)) and \
+               (abs(self.center.y - other.center.y) <= (self.half_size.y + other.half_size.y))
 
     def intersection_depth(self, other: AABB) -> Vector2 | None:
         """
-        Returns minimum translation vector (MTV) to separate self from other.
-        None if not intersecting.
+        Fused intersection and minimum translation vector (MTV) calculation.
+        Returns MTV to separate self from other, or None if not intersecting.
         """
-        if not self.intersects(other):
-            return None
         dx = self.center.x - other.center.x
-        px = (self.half_size.x + other.half_size.x) - abs(dx)
+        hx_sum = self.half_size.x + other.half_size.x
+        px = hx_sum - abs(dx)
+        if px <= 0:
+            return None
+
         dy = self.center.y - other.center.y
-        py = (self.half_size.y + other.half_size.y) - abs(dy)
+        hy_sum = self.half_size.y + other.half_size.y
+        py = hy_sum - abs(dy)
+        if py <= 0:
+            return None
+
         if px < py:
-            return Vector2(px * (1 if dx > 0 else -1), 0)
+            sign_x = 1.0 if dx > 0 else (-1.0 if dx < 0 else 1.0)
+            return Vector2(px * sign_x, 0.0)
         else:
-            return Vector2(0, py * (1 if dy > 0 else -1))
+            sign_y = 1.0 if dy > 0 else (-1.0 if dy < 0 else -1.0)
+            return Vector2(0.0, py * sign_y)
 
     def expanded(self, amount: float) -> AABB:
         return AABB(self.center.copy(),
                     Vector2(self.half_size.x + amount, self.half_size.y + amount))
+
+    def __repr__(self) -> str:
+        return f"AABB(center={self.center}, half={self.half_size})"

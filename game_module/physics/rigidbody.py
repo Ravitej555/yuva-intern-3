@@ -2,7 +2,7 @@
 Rigidbody - simple 2D rigid body with Newtonian integration.
 
 Supports forces, impulses, gravity, friction, restitution, and static/kinematic modes.
-Uses semi-implicit Euler integration and sweep-friendly AABB.
+Uses semi-implicit Euler integration and zero-allocation AABB caching.
 """
 from __future__ import annotations
 from dataclasses import dataclass, field
@@ -42,6 +42,13 @@ class Rigidbody:
     # State
     is_grounded: bool = False
     _force: Vector2 = field(default_factory=Vector2.zero, init=False, repr=False)
+    _cached_aabb: AABB = field(init=False, repr=False, default=None)
+
+    def __post_init__(self) -> None:
+        self._cached_aabb = AABB(
+            self.position,
+            Vector2(self.size.x * 0.5, self.size.y * 0.5)
+        )
 
     @property
     def inv_mass(self) -> float:
@@ -51,19 +58,33 @@ class Rigidbody:
 
     @property
     def aabb(self) -> AABB:
-        return AABB(self.position.copy(),
-                    Vector2(self.size.x * 0.5, self.size.y * 0.5))
+        # Keep center and half_size synchronized with zero allocation
+        aabb = self._cached_aabb
+        if aabb is None:
+            self._cached_aabb = AABB(
+                self.position,
+                Vector2(self.size.x * 0.5, self.size.y * 0.5)
+            )
+            return self._cached_aabb
+        aabb.center = self.position
+        aabb.half_size.x = self.size.x * 0.5
+        aabb.half_size.y = self.size.y * 0.5
+        return aabb
 
     # ---- Force application ----
     def add_force(self, force: Vector2) -> None:
         """Accumulate force for next integration step (F = m*a)."""
         if self.body_type == BodyType.DYNAMIC:
-            self._force = self._force + force
+            self._force.x += force.x
+            self._force.y += force.y
 
     def add_impulse(self, impulse: Vector2) -> None:
         """Instant velocity change: delta_v = impulse / mass."""
-        if self.body_type == BodyType.DYNAMIC and self.inv_mass > 0:
-            self.velocity = self.velocity + impulse * self.inv_mass
+        if self.body_type == BodyType.DYNAMIC:
+            inv = self.inv_mass
+            if inv > 0:
+                self.velocity.x += impulse.x * inv
+                self.velocity.y += impulse.y * inv
 
     def add_force_at_position(self, force: Vector2, world_pos: Vector2) -> None:
         """Simplified: treat as force at center (no torque in this 2D model)."""
@@ -72,23 +93,34 @@ class Rigidbody:
     # ---- Integration ----
     def integrate(self, dt: float, gravity: Vector2) -> None:
         """
-        Semi-implicit Euler:
+        Semi-implicit Euler integration using zero-allocation scalar arithmetic:
             v += (F/m + gravity*gravity_scale - drag*v) * dt
             p += v * dt
         """
         if self.body_type != BodyType.DYNAMIC:
             return
-        # Gravity
-        # a = F/m + g*scale
-        accel = self._force * self.inv_mass + gravity * self.gravity_scale
-        # Drag
-        accel = accel + self.velocity * (-self.drag)
-        self.velocity = self.velocity + accel * dt
-        self.position = self.position + self.velocity * dt
-        # Clear accumulator
-        self._force = Vector2.zero()
-        self.is_grounded = False  # reset; collision will set again
+
+        inv_m = self.inv_mass
+        g_scale = self.gravity_scale
+        # Compute acceleration components directly
+        ax = self._force.x * inv_m + gravity.x * g_scale - self.velocity.x * self.drag
+        ay = self._force.y * inv_m + gravity.y * g_scale - self.velocity.y * self.drag
+
+        # Integrate velocity
+        self.velocity.x += ax * dt
+        self.velocity.y += ay * dt
+
+        # Integrate position
+        self.position.x += self.velocity.x * dt
+        self.position.y += self.velocity.y * dt
+
+        # Reset force accumulator and contact state
+        self._force.x = 0.0
+        self._force.y = 0.0
+        self.is_grounded = False
 
     def move_kinematic(self, delta: Vector2) -> None:
         if self.body_type == BodyType.KINEMATIC:
-            self.position = self.position + delta
+            self.position.x += delta.x
+            self.position.y += delta.y
+

@@ -7,3 +7,6 @@ dist/
 build/
 .env
 generate_report.py
+~$*
+.pytest_cache/
+

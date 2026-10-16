@@ -45,29 +45,31 @@ class Enemy:
         return self.body.position.distance_to(self.player_pos)
 
     def can_see_player(self, range_: float) -> bool:
-        dist = self.distance_to_player()
-        if dist is None or dist > range_:
+        dx = self.player_pos.x - self.body.position.x
+        dy = self.player_pos.y - self.body.position.y
+        dist_sq = dx * dx + dy * dy
+        if dist_sq > range_ * range_:
             return False
-        # Optional line-of-sight via raycast
-        if self.world is not None:
-            direction = self.player_pos - self.body.position
-            hits = self.world.raycast_aabb(self.body.position, direction, dist)
-            # If first hit is not the player body, blocked - but we don't have
-            # player body separately, so treat any static between as block.
-            # Simplify: check pathfinder grid
-            if self.pathfinder is not None:
-                if not self.pathfinder._has_line_of_sight(self.body.position, self.player_pos):
-                    return False
+
+        # Grid line-of-sight test (fast & obstacle-aware)
+        if self.pathfinder is not None:
+            if not self.pathfinder._has_line_of_sight(self.body.position, self.player_pos):
+                return False
         return True
 
     def steer_towards(self, desired_velocity: Vector2, dt: float) -> None:
-        """Apply steering force towards desired velocity."""
-        steer = desired_velocity - self.body.velocity
-        # Clamp steering force
+        """Apply steering force towards desired velocity with single-sqrt clamping."""
+        sx = desired_velocity.x - self.body.velocity.x
+        sy = desired_velocity.y - self.body.velocity.y
         max_force = 25.0
-        if steer.magnitude_sq() > max_force * max_force:
-            steer = steer.normalized() * max_force
-        self.body.add_force(steer * self.body.mass)
+        steer_sq = sx * sx + sy * sy
+
+        if steer_sq > max_force * max_force and steer_sq > 1e-18:
+            factor = max_force / (steer_sq ** 0.5)
+            sx *= factor
+            sy *= factor
+
+        self.body.add_force(Vector2(sx * self.body.mass, sy * self.body.mass))
         if desired_velocity.magnitude_sq() > 1e-6:
             self.facing = desired_velocity.normalized()
 
@@ -92,6 +94,8 @@ class Enemy:
                 self.path = self.pathfinder.smooth_path(raw)
             else:
                 self.path = []
+            self.path_index = 0
+
         if self.sm:
             self.sm.update(dt)
 

@@ -64,78 +64,97 @@ class PhysicsWorld:
 
     # -- collision helpers --
     def _resolve_collisions(self) -> None:
-        # Broad-phase: sort by min.x (sweep & prune) for small N; works fine.
-        # For many bodies spatial hash would be better, but N is small here.
-        bodies = sorted(self.bodies, key=lambda b: b.aabb.min.x)
+        # Broad-phase: Sweep & Prune along X axis using zero-allocation min_x / max_x
+        bodies = sorted(self.bodies, key=lambda b: b.aabb.min_x)
         active: list[Rigidbody] = []
         for body in bodies:
-            # Remove bodies whose max.x is left of current min.x
-            active = [a for a in active if a.aabb.max.x >= body.aabb.min.x]
+            b_min_x = body.aabb.min_x
+            # Prune bodies from active interval whose max_x is left of b_min_x
+            active = [a for a in active if a.aabb.max_x >= b_min_x]
             for other in active:
                 self._try_resolve_pair(body, other)
             active.append(body)
 
     def _try_resolve_pair(self, a: Rigidbody, b: Rigidbody) -> None:
-        # Skip two statics
+        # Skip two static bodies
         if a.body_type == BodyType.STATIC and b.body_type == BodyType.STATIC:
             return
-        if not a.aabb.intersects(b.aabb):
-            return
+
+        # Fused intersection and MTV query
         mtv = a.aabb.intersection_depth(b.aabb)
-        if mtv is None or mtv.magnitude_sq() < 1e-9:
+        if mtv is None:
+            return
+        mtv_sq = mtv.magnitude_sq()
+        if mtv_sq < 1e-9:
             return
 
-        # Separate - split correction weighted by inverse mass
         inv_a = a.inv_mass
         inv_b = b.inv_mass
         total_inv = inv_a + inv_b
-        if total_inv == 0:
+        if total_inv <= 0.0:
             return
 
-        # Positional correction (Baumgarte-style, no slop for simplicity + percent)
+        # Positional correction (Baumgarte stabilization)
         percent = 0.8
-        correction = mtv * percent
-        # Distribute by inv_mass ratio
-        a.position = a.position + correction * (inv_a / total_inv)
-        b.position = b.position - correction * (inv_b / total_inv)
+        corr_scale = percent / total_inv
+        cx = mtv.x * corr_scale
+        cy = mtv.y * corr_scale
+
+        a.position.x += cx * inv_a
+        a.position.y += cy * inv_a
+        b.position.x -= cx * inv_b
+        b.position.y -= cy * inv_b
 
         # Velocity impulse along collision normal
         normal = mtv.normalized()
         if normal.magnitude_sq() < 1e-9:
             return
-        rel_vel = a.velocity - b.velocity
-        vel_along_normal = rel_vel.dot(normal)
-        # Only resolve if moving toward each other
-        if vel_along_normal > 0:
-            # Separating already
-            pass
-        else:
-            restitution = min(a.restitution, b.restitution)
-            j = -(1 + restitution) * vel_along_normal
-            j /= total_inv
-            impulse = normal * j
-            if a.body_type == BodyType.DYNAMIC:
-                a.velocity = a.velocity + impulse * inv_a
-            if b.body_type == BodyType.DYNAMIC:
-                b.velocity = b.velocity - impulse * inv_b
 
-            # Friction impulse (Coulomb model simplified)
-            tangent_vel = rel_vel - normal * rel_vel.dot(normal)
-            if tangent_vel.magnitude_sq() > 1e-9:
-                tangent = tangent_vel.normalized()
-                jt = -rel_vel.dot(tangent) / total_inv
+        # Relative velocity
+        rel_vx = a.velocity.x - b.velocity.x
+        rel_vy = a.velocity.y - b.velocity.y
+        vel_along_normal = rel_vx * normal.x + rel_vy * normal.y
+
+        # Only resolve if moving toward each other
+        if vel_along_normal < 0.0:
+            restitution = a.restitution if a.restitution < b.restitution else b.restitution
+            j = -(1.0 + restitution) * vel_along_normal / total_inv
+            impulse_x = normal.x * j
+            impulse_y = normal.y * j
+
+            if a.body_type == BodyType.DYNAMIC:
+                a.velocity.x += impulse_x * inv_a
+                a.velocity.y += impulse_y * inv_a
+            if b.body_type == BodyType.DYNAMIC:
+                b.velocity.x -= impulse_x * inv_b
+                b.velocity.y -= impulse_y * inv_b
+
+            # Tangent friction (Coulomb model)
+            tangent_vx = rel_vx - normal.x * vel_along_normal
+            tangent_vy = rel_vy - normal.y * vel_along_normal
+            tangent_sq = tangent_vx * tangent_vx + tangent_vy * tangent_vy
+            if tangent_sq > 1e-9:
+                inv_tmag = 1.0 / (tangent_sq ** 0.5)
+                tx = tangent_vx * inv_tmag
+                ty = tangent_vy * inv_tmag
+                jt = -(rel_vx * tx + rel_vy * ty) / total_inv
                 mu = (a.friction + b.friction) * 0.5
-                # Clamp friction
-                jt = max(-j * mu, min(jt, j * mu))
-                friction_impulse = tangent * jt
+                max_friction = j * mu
+                if jt > max_friction:
+                    jt = max_friction
+                elif jt < -max_friction:
+                    jt = -max_friction
+
+                f_impulse_x = tx * jt
+                f_impulse_y = ty * jt
                 if a.body_type == BodyType.DYNAMIC:
-                    a.velocity = a.velocity + friction_impulse * inv_a
+                    a.velocity.x += f_impulse_x * inv_a
+                    a.velocity.y += f_impulse_y * inv_a
                 if b.body_type == BodyType.DYNAMIC:
-                    b.velocity = b.velocity - friction_impulse * inv_b
+                    b.velocity.x -= f_impulse_x * inv_b
+                    b.velocity.y -= f_impulse_y * inv_b
 
         # Grounded check: if MTV is upward (normal.y < 0 means a is above b)
-        # Heuristic: positive y is down in our coordinate system.
-        # If mtv.y < 0, a was pushed up => a is grounded on b.
         if mtv.y < 0 and abs(mtv.y) > abs(mtv.x):
             if a.body_type == BodyType.DYNAMIC:
                 a.is_grounded = True
@@ -165,26 +184,46 @@ class PhysicsWorld:
 
     @staticmethod
     def _ray_aabb(origin: Vector2, dir_n: Vector2, box, max_dist: float) -> float | None:
-        # Slab method
+        """Optimized slab method with zero reflection overhead."""
         t_min = 0.0
         t_max = max_dist
-        for axis in ("x", "y"):
-            o = getattr(origin, axis)
-            d = getattr(dir_n, axis)
-            mn = getattr(box.min, axis)
-            mx = getattr(box.max, axis)
-            if abs(d) < 1e-9:
-                if o < mn or o > mx:
-                    return None
-            else:
-                t1 = (mn - o) / d
-                t2 = (mx - o) / d
-                if t1 > t2:
-                    t1, t2 = t2, t1
-                t_min = max(t_min, t1)
-                t_max = min(t_max, t2)
-                if t_min > t_max:
-                    return None
-        if 0 <= t_min <= max_dist:
+
+        # X-axis
+        ox, dx = origin.x, dir_n.x
+        mn_x, mx_x = box.min_x, box.max_x
+        if abs(dx) < 1e-9:
+            if ox < mn_x or ox > mx_x:
+                return None
+        else:
+            t1 = (mn_x - ox) / dx
+            t2 = (mx_x - ox) / dx
+            if t1 > t2:
+                t1, t2 = t2, t1
+            if t1 > t_min:
+                t_min = t1
+            if t2 < t_max:
+                t_max = t2
+            if t_min > t_max:
+                return None
+
+        # Y-axis
+        oy, dy = origin.y, dir_n.y
+        mn_y, mx_y = box.min_y, box.max_y
+        if abs(dy) < 1e-9:
+            if oy < mn_y or oy > mx_y:
+                return None
+        else:
+            t1 = (mn_y - oy) / dy
+            t2 = (mx_y - oy) / dy
+            if t1 > t2:
+                t1, t2 = t2, t1
+            if t1 > t_min:
+                t_min = t1
+            if t2 < t_max:
+                t_max = t2
+            if t_min > t_max:
+                return None
+
+        if 0.0 <= t_min <= max_dist:
             return t_min
         return None
